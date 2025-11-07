@@ -138,6 +138,34 @@ HTWK Gym uses Python virtual environments for flexible dependency management. Fo
 
 ### 1. Training
 
+#### DockerFile
+1. Download Isaac Gym from [NVIDIA’s website](https://developer.nvidia.com/isaac-gym/download).
+
+    Extract and install:
+
+2. Build: 
+
+docker build -t booster-gym .
+
+3. Run container
+
+If you want to see the simulation window, use everytime before running the container:
+
+xhost +local:docker
+
+docker run \
+    --gpus all \
+    -it \
+    --rm \
+    -e "DISPLAY=$DISPLAY" \
+    -e "NVIDIA_VISIBLE_DEVICES=all" \
+    -e "NVIDIA_DRIVER_CAPABILITIES=all" \
+    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    -v $(pwd)/logs:/app/logs \
+    -v $(pwd)/videos:/app/videos \
+    --name booster-gym-env \
+    booster-gym
+
 HTWK Gym supports multiple robot platforms and task types. To start training a policy:
 
 ```sh
