@@ -382,6 +382,18 @@ $ python train.py --task=T1/Kicking --num_envs=1024
 $ python play.py --task=T1/Kicking --checkpoint=-1
 ```
 
+### Variable Target Kicking & Fine-Tuning
+The updated `envs/T1/Kicking.yaml` now randomizes the kick target inside the configurable field dimensions and extends the observation vector to include the ball→target offset. You can either train from scratch or fine-tune from an older 44-dim checkpoint using the new helper flag:
+
+```sh
+# Fine-tune a legacy checkpoint to the new 47-dim observation space
+$ python train.py --task=T1/Kicking --num_envs=1024 \
+    --load_run_finetune=/path/to/old/checkpoint.pth
+
+# Play using the latest checkpoint with the variable target logic
+$ python play.py --task=T1/Kicking --checkpoint=-1
+```
+
 ### K1 Robot Platform
 ```sh
 # Train K1 parameterized walking

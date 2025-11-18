@@ -10,10 +10,13 @@ basic:
 
 env:
   num_envs: 1
-  num_observations: 44
+  num_observations: 47
   num_privileged_obs: 20
   num_actions: 12
   env_spacing: 5.  # not used with plane terrain
+  field_dims:
+    field_length: 10.0
+    field_width: 10.0
 
 runner:
   horizon_length: 24
@@ -335,7 +338,12 @@ rewards:
   max_ball_vel_x: 3
   
   # Parameters for new kick-related rewards
-  ball_target_position: [6.0, 0.0] # Target position for ball to move toward (world frame, z should be ball radius)
+  ball_target_position:
+    randomize: true
+    fixed_pos: [6.0, 0.0, 0.05]
+    target_radius_min: 1.0
+    target_radius_max: 4.0
+    target_wedge_angle: 3.14159
   max_ball_vel_target_reward: 10.0      # Max reward for ball velocity toward target
   ball_vel_target_direction_sigma: 1.0 # Sigma for ball velocity toward target reward
   ball_velocity_decay_time: 0.1 # Time constant in seconds for ball velocity decay

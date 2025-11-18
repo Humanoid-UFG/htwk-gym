@@ -119,6 +119,7 @@ class Runner:
         parser.add_argument("--rl_device", type=str, help="Device for the RL algorithm. Overrides config file if provided.")
         parser.add_argument("--seed", type=int, help="Random seed. Overrides config file if provided.")
         parser.add_argument("--max_iterations", type=int, help="Maximum number of training iterations. Overrides config file if provided.")
+        parser.add_argument("--load_run_finetune", type=str, help="Path of a checkpoint to load for finetuning when observation space changes.")
         self.args = parser.parse_args()
 
     # Override config file with args if needed
@@ -128,6 +129,8 @@ class Runner:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
         for arg in vars(self.args):
             if getattr(self.args, arg) is not None:
+                if arg == "load_run_finetune":
+                    continue
                 if arg == "num_envs":
                     self.cfg["env"][arg] = getattr(self.args, arg)
                 else:
@@ -148,6 +151,11 @@ class Runner:
         torch.cuda.manual_seed_all(self.cfg["basic"]["seed"])
 
     def _load(self):
+        finetune_path = getattr(self.args, "load_run_finetune", None)
+        if finetune_path:
+            self._load_finetune_checkpoint(finetune_path)
+            return
+
         if not self.cfg["basic"]["checkpoint"]:
             return
         if (self.cfg["basic"]["checkpoint"] == "-1") or (self.cfg["basic"]["checkpoint"] == -1):
@@ -182,6 +190,76 @@ class Runner:
             self.optimizer.load_state_dict(model_dict["optimizer"])
         except Exception as e:
             print(f"Failed to load optimizer: {e}")
+
+    def _load_finetune_checkpoint(self, checkpoint_path):
+        checkpoint_path = os.path.expanduser(checkpoint_path)
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"Finetune checkpoint not found: {checkpoint_path}")
+        print(f"Finetune loading model from {checkpoint_path}")
+        model_dict = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        pretrained_state = model_dict.get("model", model_dict)
+        adapted_state = self._adapt_pretrained_state(pretrained_state)
+        load_result = self.model.load_state_dict(adapted_state, strict=False)
+        if load_result.missing_keys:
+            print(f"Missing keys after finetune load: {load_result.missing_keys}")
+        if load_result.unexpected_keys:
+            print(f"Unexpected keys after finetune load: {load_result.unexpected_keys}")
+        if "curriculum" in model_dict:
+            self.env.curriculum_prob = model_dict["curriculum"]
+
+    def _adapt_pretrained_state(self, pretrained_state):
+        current_state = self.model.state_dict()
+        adapted_state = {}
+        for key, current_tensor in current_state.items():
+            if key not in pretrained_state:
+                adapted_state[key] = current_tensor
+                continue
+            pretrained_tensor = pretrained_state[key].to(current_tensor.device, dtype=current_tensor.dtype)
+            if pretrained_tensor.shape == current_tensor.shape:
+                adapted_state[key] = pretrained_tensor
+                continue
+            if key == "actor.0.weight":
+                adapted_state[key] = self._expand_actor_input(pretrained_tensor, current_tensor)
+            elif key == "critic.0.weight":
+                adapted_state[key] = self._expand_critic_input(pretrained_tensor, current_tensor)
+            else:
+                adapted_state[key] = current_tensor
+        return adapted_state
+
+    def _expand_actor_input(self, pretrained_tensor, current_tensor):
+        new_in_features = current_tensor.shape[1]
+        old_in_features = pretrained_tensor.shape[1]
+        if new_in_features <= old_in_features:
+            return pretrained_tensor[:, :new_in_features]
+        pad_cols = new_in_features - old_in_features
+        pad = torch.zeros(pretrained_tensor.shape[0], pad_cols, device=current_tensor.device, dtype=current_tensor.dtype)
+        return torch.cat((pretrained_tensor, pad), dim=1)
+
+    def _expand_critic_input(self, pretrained_tensor, current_tensor):
+        current_obs = self.env.num_obs
+        current_priv = self.env.num_privileged_obs
+        new_in_features = current_tensor.shape[1]
+        old_in_features = pretrained_tensor.shape[1]
+        old_obs = old_in_features - current_priv
+        obs_part = pretrained_tensor[:, :old_obs]
+        priv_part = pretrained_tensor[:, old_obs:]
+        delta_obs = current_obs - old_obs
+        if delta_obs > 0:
+            pad = torch.zeros(pretrained_tensor.shape[0], delta_obs, device=current_tensor.device, dtype=current_tensor.dtype)
+            obs_part = torch.cat((obs_part, pad), dim=1)
+        elif delta_obs < 0:
+            obs_part = obs_part[:, :current_obs]
+        if priv_part.shape[1] != current_priv:
+            if priv_part.shape[1] > current_priv:
+                priv_part = priv_part[:, :current_priv]
+            else:
+                pad_priv = torch.zeros(pretrained_tensor.shape[0], current_priv - priv_part.shape[1], device=current_tensor.device, dtype=current_tensor.dtype)
+                priv_part = torch.cat((priv_part, pad_priv), dim=1)
+        combined = torch.cat((obs_part, priv_part), dim=1)
+        if combined.shape[1] < new_in_features:
+            pad = torch.zeros(pretrained_tensor.shape[0], new_in_features - combined.shape[1], device=current_tensor.device, dtype=current_tensor.dtype)
+            combined = torch.cat((combined, pad), dim=1)
+        return combined[:, :new_in_features]
 
     def train(self):
         self.recorder = Recorder(self.cfg)

@@ -38,6 +38,12 @@ class Kicking(BaseTask):
 
     def _create_envs(self):
         self.num_envs = self.cfg["env"]["num_envs"]
+        field_cfg = self.cfg["env"].get("field_dims", {})
+        self.field_length = field_cfg.get("field_length", 10.0)
+        self.field_width = field_cfg.get("field_width", 10.0)
+        self.field_half_length = self.field_length * 0.5
+        self.field_half_width = self.field_width * 0.5
+
         asset_cfg = self.cfg["asset"]
         asset_root = os.path.dirname(asset_cfg["file"])
         asset_file = os.path.basename(asset_cfg["file"])
@@ -77,6 +83,7 @@ class Kicking(BaseTask):
         ball_asset_options.thickness = ball_cfg["thickness"]
         
         ball_asset = self.gym.load_asset(self.sim, ball_root, ball_file, ball_asset_options)
+        self.ball_rigid_body_count = self.gym.get_asset_rigid_body_count(ball_asset)
 
         # Store ball properties
         self.ball_radius = 0.05  # From URDF
@@ -84,6 +91,24 @@ class Kicking(BaseTask):
         self.ball_init_rot = to_torch(ball_cfg["init_rot"], device=self.device)
         self.ball_init_lin_vel = to_torch(ball_cfg["init_lin_vel"], device=self.device)
         self.ball_init_ang_vel = to_torch(ball_cfg["init_ang_vel"], device=self.device)
+
+        target_cfg = self.cfg["rewards"].get("ball_target_position", {})
+        self.target_randomize = target_cfg.get("randomize", False)
+        default_target = target_cfg.get("fixed_pos", [6.0, 0.0, self.ball_radius])
+        self.target_fixed_pos = to_torch(default_target, device=self.device)
+        self.target_radius_min = target_cfg.get("target_radius_min", 1.0)
+        self.target_radius_max = target_cfg.get("target_radius_max", 4.0)
+        self.target_wedge_angle = target_cfg.get("target_wedge_angle", float(np.pi))
+        self.target_marker_radius = target_cfg.get("visual_radius", 0.05)
+
+        target_asset_options = gymapi.AssetOptions()
+        target_asset_options.disable_gravity = True
+        target_asset_options.fix_base_link = True
+        target_asset_options.collapse_fixed_joints = True
+        target_asset_options.thickness = 0.0
+        target_asset_options.density = 0.0
+        target_asset = self.gym.create_sphere(self.sim, self.target_marker_radius, target_asset_options)
+        self.target_rigid_body_count = self.gym.get_asset_rigid_body_count(target_asset)
 
         # Continue with robot setup...
         self.num_dofs = self.gym.get_asset_dof_count(robot_asset)
@@ -154,7 +179,12 @@ class Kicking(BaseTask):
         self.envs = []
         self.actor_handles = []
         self.ball_handles = []  # Store ball handles
+        self.target_handles = []
         self.base_mass_scaled = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device)
+        self.ball_actor_id = 1
+        self.target_actor_id = 2
+        self.actors_per_env = 3
+        target_pose_list = self.target_fixed_pos.detach().cpu().tolist()
         
         for i in range(self.num_envs):
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
@@ -193,12 +223,22 @@ class Kicking(BaseTask):
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
             self.ball_handles.append(ball_handle)
+            target_pose = gymapi.Transform()
+            target_pose.p = gymapi.Vec3(target_pose_list[0], target_pose_list[1], target_pose_list[2])
+            target_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+            target_handle = self.gym.create_actor(env_handle, target_asset, target_pose, "kick_target", i)
+            self.gym.set_rigid_body_color(env_handle, target_handle, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0))
+            self.target_handles.append(target_handle)
 
         # Initialize ball state tensors
         self.ball_pos = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
         self.ball_rot = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device)
         self.ball_lin_vel = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
         self.ball_ang_vel = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
+        self.target_pos = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
+        self.ball_body_index = self.num_bodies
+        self.target_body_index = self.num_bodies + self.ball_rigid_body_count
+        self.total_bodies_per_env = self.num_bodies + self.ball_rigid_body_count + self.target_rigid_body_count
 
     def _process_rigid_body_props(self, props, i):
         for j in range(self.num_bodies):
@@ -268,19 +308,20 @@ class Kicking(BaseTask):
         # create some wrapper tensors for different slices
         root_states = gymtorch.wrap_tensor(actor_root_state)
         # Reshape root states to separate robot and ball states
-        self.root_states = root_states.view(self.num_envs, 2, 13)
+        self.root_states = root_states.view(self.num_envs, self.actors_per_env, 13)
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 1]
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)  # shape: num_envs, num_bodies, xyz axis
-        self.body_states = gymtorch.wrap_tensor(body_state).view(self.num_envs, self.num_bodies + 1, 13)
+        self.body_states = gymtorch.wrap_tensor(body_state).view(self.num_envs, self.total_bodies_per_env, 13)
         # Get robot states (index 0) and ball states (index 1)
         self.base_pos = self.root_states[:, 0, 0:3]  # Robot position
         self.base_quat = self.root_states[:, 0, 3:7]  # Robot quaternion
-        self.ball_pos = self.root_states[:, 1, 0:3]  # Ball position
-        self.ball_rot = self.root_states[:, 1, 3:7]  # Ball quaternion
-        self.ball_lin_vel = self.body_states[:, -1, 7:10]  # Ball linear velocity
-        self.ball_ang_vel = self.body_states[:, -1, 10:13]  # Ball angular velocity
+        self.ball_pos = self.root_states[:, self.ball_actor_id, 0:3]  # Ball position
+        self.ball_rot = self.root_states[:, self.ball_actor_id, 3:7]  # Ball quaternion
+        self.ball_lin_vel = self.body_states[:, self.ball_body_index, 7:10]  # Ball linear velocity
+        self.ball_ang_vel = self.body_states[:, self.ball_body_index, 10:13]  # Ball angular velocity
+        self.target_pos = self.root_states[:, self.target_actor_id, 0:3]
         self.feet_pos = self.body_states[:, self.feet_indices, 0:3]
         self.feet_quat = self.body_states[:, self.feet_indices, 3:7]
 
@@ -333,7 +374,7 @@ class Kicking(BaseTask):
             if not found:
                 self.default_dof_pos[:, i] = self.cfg["init_state"]["default_joint_angles"]["default"]
 
-        self.last_ball_lin_vel_world = torch.zeros_like(self.body_states[:, -1, 7:10]) # World frame
+        self.last_ball_lin_vel_world = torch.zeros_like(self.body_states[:, self.ball_body_index, 7:10]) # World frame
 
     def _prepare_reward_function(self):
         """Prepares a list of reward functions, whcih will be called to compute the total reward.
@@ -416,12 +457,12 @@ class Kicking(BaseTask):
             
             # Get ball and robot state information
             ball_pos = self.ball_pos[self.log_env_id].cpu().numpy()
-            ball_vel_world = self.root_states[self.log_env_id, 1, 7:10].cpu().numpy()
+            ball_vel_world = self.root_states[self.log_env_id, self.ball_actor_id, 7:10].cpu().numpy()
             robot_pos = self.base_pos[self.log_env_id].cpu().numpy()
             robot_lin_vel = self.base_lin_vel[self.log_env_id].cpu().numpy()
             
             # Calculate derived metrics
-            ball_speed = torch.norm(self.root_states[self.log_env_id, 1, 7:10]).item()
+            ball_speed = torch.norm(self.root_states[self.log_env_id, self.ball_actor_id, 7:10]).item()
             ball_distance_to_robot = torch.norm(self.ball_pos[self.log_env_id] - self.base_pos[self.log_env_id]).item()
             
             # Prepare row data
@@ -460,7 +501,7 @@ class Kicking(BaseTask):
         
         self.env_resets += env_ids.shape[0]
 
-        velocity_before_reset = torch.norm(self.root_states[env_ids, 1, 7:10], dim=1)
+        velocity_before_reset = torch.norm(self.root_states[env_ids, self.ball_actor_id, 7:10], dim=1)
         
         # only get velocities that are greater than 0.1
         velocity_before_reset = velocity_before_reset[velocity_before_reset > 0.1]
@@ -491,9 +532,8 @@ class Kicking(BaseTask):
     def _reset_dofs(self, env_ids):
         self.dof_pos[env_ids] = apply_randomization(self.default_dof_pos, self.cfg["randomization"].get("init_dof_pos"))
         self.dof_vel[env_ids] = 0.0
-        # Multiply by 2 because there are 2 actors per environment (robot and ball)
-        # This ensures we only update the robot actor's DOFs
-        env_ids_int32 = (2 * env_ids).to(dtype=torch.int32)
+        # Multiply by number of actors per environment to retrieve robot actor indices
+        env_ids_int32 = (self.actors_per_env * env_ids).to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(
             self.sim, gymtorch.unwrap_tensor(self.dof_state), gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32)
         )
@@ -519,20 +559,23 @@ class Kicking(BaseTask):
 
         # Reset ball in front of the (newly reset) robot
         self._reset_ball_at_robot_front(env_ids)
+        self._reset_target(env_ids)
 
-        # Update the simulation with new state tensor for both robot and ball
-        # The self.root_states tensor has been updated for both.
-        robot_actor_indices = 2 * env_ids
-        ball_actor_indices = 2 * env_ids + 1
-        
-        actor_indices_to_update = torch.stack((robot_actor_indices, ball_actor_indices), dim=-1).view(-1).to(dtype=torch.int32)
-        num_indices = actor_indices_to_update.shape[0]
+        # Update the simulation with new state tensor for robot, ball and target
+        actor_indices = torch.stack(
+            (
+                self.actors_per_env * env_ids,
+                self.actors_per_env * env_ids + self.ball_actor_id,
+                self.actors_per_env * env_ids + self.target_actor_id,
+            ),
+            dim=-1,
+        ).view(-1).to(dtype=torch.int32)
 
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
-            gymtorch.unwrap_tensor(self.root_states),  # Full root states buffer
-            gymtorch.unwrap_tensor(actor_indices_to_update),  # Indices of actors to update
-            num_indices  # Number of actor indices
+            gymtorch.unwrap_tensor(self.root_states),
+            gymtorch.unwrap_tensor(actor_indices),
+            actor_indices.shape[0],
         )
 
     def _reset_ball_at_robot_front(self, env_ids_to_reset_ball):
@@ -565,19 +608,19 @@ class Kicking(BaseTask):
 
 
         # Set ball position
-        self.root_states[env_ids_to_reset_ball, 1, 0] = ball_target_xy[:, 0]
-        self.root_states[env_ids_to_reset_ball, 1, 1] = ball_target_xy[:, 1]
-        self.root_states[env_ids_to_reset_ball, 1, 2] = ball_target_z
+        self.root_states[env_ids_to_reset_ball, self.ball_actor_id, 0] = ball_target_xy[:, 0]
+        self.root_states[env_ids_to_reset_ball, self.ball_actor_id, 1] = ball_target_xy[:, 1]
+        self.root_states[env_ids_to_reset_ball, self.ball_actor_id, 2] = ball_target_z
         
         # Set ball orientation to default (identity quaternion)
         identity_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device).unsqueeze(0).repeat(len(env_ids_to_reset_ball), 1)
-        self.root_states[env_ids_to_reset_ball, 1, 3:7] = identity_quat
+        self.root_states[env_ids_to_reset_ball, self.ball_actor_id, 3:7] = identity_quat
         
         # Set ball linear and angular velocities to zero
-        self.root_states[env_ids_to_reset_ball, 1, 7:13] = 0.0
+        self.root_states[env_ids_to_reset_ball, self.ball_actor_id, 7:13] = 0.0
 
         # Update only the ball actors in the simulation
-        ball_actor_indices = (2 * env_ids_to_reset_ball + 1).to(dtype=torch.int32)
+        ball_actor_indices = (self.actors_per_env * env_ids_to_reset_ball + self.ball_actor_id).to(dtype=torch.int32)
         if len(ball_actor_indices) > 0:
             self.gym.set_actor_root_state_tensor_indexed(
                 self.sim,
@@ -585,6 +628,44 @@ class Kicking(BaseTask):
                 gymtorch.unwrap_tensor(ball_actor_indices),
                 len(ball_actor_indices)
             )
+
+    def _reset_target(self, env_ids):
+        """Resets or randomizes the kick target for the specified environment IDs."""
+        if len(env_ids) == 0:
+            return
+
+        num_reset = len(env_ids)
+        if self.target_randomize:
+            base_pos = self.root_states[env_ids, 0, 0:3]
+            base_quat = self.root_states[env_ids, 0, 3:7]
+            _, _, base_yaw = get_euler_xyz(base_quat)
+
+            theta_half = 0.5 * self.target_wedge_angle
+            theta = torch_rand_float(-theta_half, theta_half, (num_reset, 1), device=self.device).squeeze(-1)
+            radius = torch_rand_float(self.target_radius_min, self.target_radius_max, (num_reset, 1), device=self.device).squeeze(-1)
+
+            local_x = torch.cos(theta) * radius
+            local_y = torch.sin(theta) * radius
+
+            cos_yaw = torch.cos(base_yaw)
+            sin_yaw = torch.sin(base_yaw)
+
+            world_x = base_pos[:, 0] + cos_yaw * local_x - sin_yaw * local_y
+            world_y = base_pos[:, 1] + sin_yaw * local_x + cos_yaw * local_y
+            target_z = torch.full_like(world_x, self.target_fixed_pos[2])
+
+            world_x = torch.clamp(world_x, -self.field_half_length, self.field_half_length)
+            world_y = torch.clamp(world_y, -self.field_half_width, self.field_half_width)
+
+            target_positions = torch.stack((world_x, world_y, target_z), dim=-1)
+        else:
+            target_positions = self.target_fixed_pos.unsqueeze(0).repeat(num_reset, 1)
+
+        self.target_pos[env_ids] = target_positions
+        self.root_states[env_ids, self.target_actor_id, 0:3] = target_positions
+        identity_quat = to_torch([0.0, 0.0, 0.0, 1.0], device=self.device).unsqueeze(0).repeat(num_reset, 1)
+        self.root_states[env_ids, self.target_actor_id, 3:7] = identity_quat
+        self.root_states[env_ids, self.target_actor_id, 7:13] = 0.0
 
     def _teleport_robot(self):
         if self.terrain.type == "plane":
@@ -705,16 +786,17 @@ class Kicking(BaseTask):
         self.render()
 
         # Store previous ball velocity in world frame *before* refreshing root states for current step
-        prev_ball_lin_vel_world = self.root_states[:, 1, 7:10].clone()
+        prev_ball_lin_vel_world = self.root_states[:, self.ball_actor_id, 7:10].clone()
 
         # post physics step
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         
-        self.ball_pos[:] = self.root_states[:, 1, 0:3]
-        self.ball_lin_vel[:] = self.body_states[:, -1, 7:10]
-        self.ball_ang_vel[:] = self.body_states[:, -1, 10:13]
+        self.ball_pos[:] = self.root_states[:, self.ball_actor_id, 0:3]
+        self.ball_lin_vel[:] = self.body_states[:, self.ball_body_index, 7:10]
+        self.ball_ang_vel[:] = self.body_states[:, self.ball_body_index, 10:13]
+        self.target_pos[:] = self.root_states[:, self.target_actor_id, 0:3]
 
         self.base_pos[:] = self.root_states[:, 0, 0:3]
         self.base_quat[:] = self.root_states[:, 0, 3:7]
@@ -740,7 +822,7 @@ class Kicking(BaseTask):
 
         # Update time_since_ball_is_still_buf
         ball_speed_threshold = self.cfg["rewards"].get("ball_stationary_speed_threshold", 0.1) # Configurable threshold
-        ball_is_active = torch.norm(self.root_states[:, 1, 7:10], dim=-1) > ball_speed_threshold
+        ball_is_active = torch.norm(self.root_states[:, self.ball_actor_id, 7:10], dim=-1) > ball_speed_threshold
         self.time_since_ball_is_still_buf = torch.where(ball_is_active, 
                                                         torch.zeros_like(self.time_since_ball_is_still_buf), 
                                                         self.time_since_ball_is_still_buf + self.dt)
@@ -757,12 +839,12 @@ class Kicking(BaseTask):
         if len(ball_only_reset_env_ids) > 0:
             self._reset_ball_at_robot_front(ball_only_reset_env_ids)
             # Update convenience tensors for the reset balls as _compute_observations will use them
-            self.ball_pos[ball_only_reset_env_ids] = self.root_states[ball_only_reset_env_ids, 1, 0:3]
-            ball_quat_reset = self.root_states[ball_only_reset_env_ids, 1, 3:7]
+            self.ball_pos[ball_only_reset_env_ids] = self.root_states[ball_only_reset_env_ids, self.ball_actor_id, 0:3]
+            ball_quat_reset = self.root_states[ball_only_reset_env_ids, self.ball_actor_id, 3:7]
             self.ball_rot[ball_only_reset_env_ids] = ball_quat_reset
             # Velocities in root_states are world, convert to local for convenience tensors
-            world_lin_vel_reset = self.root_states[ball_only_reset_env_ids, 1, 7:10]
-            world_ang_vel_reset = self.root_states[ball_only_reset_env_ids, 1, 10:13]
+            world_lin_vel_reset = self.root_states[ball_only_reset_env_ids, self.ball_actor_id, 7:10]
+            world_ang_vel_reset = self.root_states[ball_only_reset_env_ids, self.ball_actor_id, 10:13]
             self.ball_lin_vel[ball_only_reset_env_ids] = quat_rotate_inverse(ball_quat_reset, world_lin_vel_reset)
             self.ball_ang_vel[ball_only_reset_env_ids] = quat_rotate_inverse(ball_quat_reset, world_ang_vel_reset)
             
@@ -777,7 +859,7 @@ class Kicking(BaseTask):
         # For envs that were not reset (neither full nor ball-only), this is their current velocity.
         # For envs that *were* reset (either full or ball-only), their velocity was set to 0.0 during reset,
         # so this correctly reflects their "last" velocity as 0 before the next step.
-        self.last_ball_lin_vel_world[:] = self.body_states[:, -1, 7:10]
+        self.last_ball_lin_vel_world[:] = self.body_states[:, self.ball_body_index, 7:10]
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         if len(env_ids) > 0:
@@ -925,6 +1007,8 @@ class Kicking(BaseTask):
         # Calculate ball position relative to the robot
         ball_pos_world_frame = self.ball_pos - self.base_pos
         relative_ball_pos = quat_rotate_inverse(self.base_quat, ball_pos_world_frame)
+        ball_to_target = self.target_pos - self.ball_pos
+        ball_to_target_local = quat_rotate_inverse(self.base_quat, ball_to_target)
 
         self.obs_buf = torch.cat(
             (
@@ -939,6 +1023,7 @@ class Kicking(BaseTask):
                 apply_randomization(self.dof_pos - self.default_dof_pos, self.cfg["noise"].get("dof_pos")) * self.cfg["normalization"]["dof_pos"],
                 apply_randomization(self.dof_vel, self.cfg["noise"].get("dof_vel")) * self.cfg["normalization"]["dof_vel"],
                 self.actions,
+                ball_to_target_local,
             ),
             dim=-1,
         )
@@ -1119,12 +1204,12 @@ class Kicking(BaseTask):
         # cfg["rewards"]["ball_vel_target_direction_sigma"] - for scaling the reward
         # cfg["rewards"]["ball_velocity_decay_time"] - time constant for exponential decay when ball is moving
         
-        # Get the target position from config
-        target_position = to_torch([5.0, 0.0, 0.05], device=self.device).unsqueeze(0)
+        # Get the target position for each environment
+        target_position = self.target_pos
         
         # Get current ball position and velocity (in world frame)
-        ball_pos_world = self.body_states[:, -1, 0:3]
-        ball_vel_world = self.body_states[:, -1, 7:10]
+        ball_pos_world = self.ball_pos
+        ball_vel_world = self.body_states[:, self.ball_body_index, 7:10]
         
         # Calculate the direction vector from ball to target
         ball_to_target = target_position - ball_pos_world
@@ -1161,7 +1246,7 @@ class Kicking(BaseTask):
         # cfg["rewards"]["foot_velocity_towards_ball_scale"] - Scale for velocity reward
         # cfg["rewards"]["foot_velocity_weight"] - Weight for velocity vs proximity reward (0-1)
 
-        current_ball_pos_world = self.body_states[:, -1, 0:3]
+        current_ball_pos_world = self.ball_pos
 
         foot_ball_dist_left = torch.norm(self.feet_pos[:, 0, :] - current_ball_pos_world, dim=-1)
         foot_ball_dist_right = torch.norm(self.feet_pos[:, 1, :] - current_ball_pos_world, dim=-1)
@@ -1187,7 +1272,7 @@ class Kicking(BaseTask):
 
         robot_pos_world = self.base_pos
         robot_quat_world = self.base_quat
-        ball_pos_world = self.root_states[:, 1, 0:3]
+        ball_pos_world = self.root_states[:, self.ball_actor_id, 0:3]
         
         # Robot's forward vector in world frame
         # Assuming robot's local forward is X-axis: [1,0,0]
@@ -1199,8 +1284,8 @@ class Kicking(BaseTask):
         robot_to_ball_world_normalized = robot_to_ball_world / (torch.norm(robot_to_ball_world, dim=-1, keepdim=True) + 1e-6)
 
         # Alignment with a fixed target position
-        kick_target_pos_world = to_torch(self.cfg["rewards"].get("kick_target_pos_world", [5.0, 0.0, self.ball_radius]), device=self.device).unsqueeze(0)
-        robot_to_target_world = kick_target_pos_world - robot_pos_world
+        target_pos_world = self.target_pos
+        robot_to_target_world = target_pos_world - robot_pos_world
         robot_to_target_world_normalized = robot_to_target_world / (torch.norm(robot_to_target_world, dim=-1, keepdim=True) + 1e-6)
         
         alignment_to_target = torch.sum(robot_forward_world * robot_to_target_world_normalized, dim=-1)
@@ -1231,7 +1316,7 @@ class Kicking(BaseTask):
     def _reward_ball_acceleration(self):
         """Rewards ball acceleration towards the target direction, encouraging effective kicks."""
         # Get current and previous ball velocities in world frame
-        current_ball_vel_world = self.body_states[:, -1, 7:9]
+        current_ball_vel_world = self.body_states[:, self.ball_body_index, 7:9]
         prev_ball_vel_world = self.last_ball_lin_vel_world[:,:2]
         
         # Calculate ball acceleration (change in velocity / time)
