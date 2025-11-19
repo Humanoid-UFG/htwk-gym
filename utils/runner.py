@@ -7,6 +7,14 @@ import random
 import time
 import signal
 import imageio
+import csv
+import math
+from collections import defaultdict
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # Import envs first to initialize isaacgym modules
 from envs import *
@@ -120,6 +128,7 @@ class Runner:
         parser.add_argument("--seed", type=int, help="Random seed. Overrides config file if provided.")
         parser.add_argument("--max_iterations", type=int, help="Maximum number of training iterations. Overrides config file if provided.")
         parser.add_argument("--load_run_finetune", type=str, help="Path of a checkpoint to load for finetuning when observation space changes.")
+        parser.add_argument("--evaluation", action="store_true", help="Enable deterministic evaluation benchmark instead of interactive play.")
         self.args = parser.parse_args()
 
     # Override config file with args if needed
@@ -129,7 +138,7 @@ class Runner:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
         for arg in vars(self.args):
             if getattr(self.args, arg) is not None:
-                if arg == "load_run_finetune":
+                if arg in ("load_run_finetune", "evaluation"):
                     continue
                 if arg == "num_envs":
                     self.cfg["env"][arg] = getattr(self.args, arg)
@@ -380,6 +389,10 @@ class Runner:
             print("epoch: {}/{}".format(it + 1, self.cfg["basic"]["max_iterations"]))
 
     def play(self):
+        if getattr(self.args, "evaluation", False):
+            self._run_evaluation()
+            return
+
         obs, infos = self.env.reset()
         obs = obs.to(self.device)
         if self.cfg["viewer"]["record_video"]:
@@ -404,6 +417,184 @@ class Runner:
                     if self.interrupt:
                         raise KeyboardInterrupt
                     signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    def _run_evaluation(self):
+        eval_cfg = self.cfg.get("evaluation")
+        if eval_cfg is None:
+            raise ValueError("Evaluation configuration not found in YAML file.")
+        if self.env.num_envs != 1:
+            print("Evaluation mode currently supports only a single environment (num_envs = 1). Making the variable with h=just one env")
+            self.env.num_envs = 1
+
+        grid_cfg = eval_cfg["target_grid"]
+        distance_x = float(grid_cfg["distance_x"])
+        y_values = np.linspace(grid_cfg["width_range"][0], grid_cfg["width_range"][1], grid_cfg["num_points_y"])
+        z_values = np.linspace(grid_cfg["height_range"][0], grid_cfg["height_range"][1], grid_cfg["num_points_z"])
+        episodes_per_target = int(eval_cfg["num_episodes_per_target"])
+        max_steps = max(1, int(eval_cfg["max_episode_length_s"] / self.env.dt))
+        reset_cfg = eval_cfg["fixed_reset"]
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join("evaluation_logs", timestamp)
+        os.makedirs(output_dir, exist_ok=True)
+        csv_path = os.path.join(output_dir, "kicking_eval_data.csv")
+
+        csv_rows = []
+        aggregated = defaultdict(lambda: {"errors": [], "success": 0, "attempts": 0})
+
+        try:
+            for y in y_values:
+                for z in z_values:
+                    target = [distance_x, float(y), float(z)]
+                    key = (round(float(y), 4), round(float(z), 4))
+                    print(f"Avaliando alvo Y={y:.2f} m, Z={z:.2f} m ...")
+                    self.env.set_evaluation_mode(target_pos=target, reset_config=reset_cfg)
+                    for episode_idx in range(episodes_per_target):
+                        episode_result = self._run_single_evaluation_episode(distance_x, target, max_steps)
+                        aggregated[key]["attempts"] += 1
+                        if episode_result["success"]:
+                            aggregated[key]["success"] += 1
+                        if episode_result["error"] is not None:
+                            aggregated[key]["errors"].append(episode_result["error"])
+                        csv_rows.append(
+                            {
+                                "target_y": round(target[1], 4),
+                                "target_z": round(target[2], 4),
+                                "impact_y": "" if episode_result["impact"] is None else round(episode_result["impact"][0], 4),
+                                "impact_z": "" if episode_result["impact"] is None else round(episode_result["impact"][1], 4),
+                                "error": "" if episode_result["error"] is None else round(episode_result["error"], 4),
+                                "success": int(episode_result["success"]),
+                            }
+                        )
+        finally:
+            self.env.set_evaluation_mode()
+
+        self._write_evaluation_csv(csv_path, csv_rows)
+        self._export_evaluation_reports(aggregated, y_values, z_values, output_dir, timestamp)
+        print(f"Avaliação finalizada. Resultados em: {csv_path}")
+
+    def _run_single_evaluation_episode(self, plane_x, target_pos, max_steps):
+        obs, infos = self.env.reset()
+        obs = obs.to(self.device)
+        prev_ball = self.env.ball_pos[0].detach().cpu().numpy().copy()
+        impact_point = None
+        success = False
+        ball_radius = getattr(self.env, "ball_radius", 0.05)
+
+        for step in range(max_steps):
+            with torch.no_grad():
+                dist = self.model.act(obs)
+                act = dist.loc
+            obs, rew, done, infos = self.env.step(act)
+            obs = obs.to(self.device)
+            ball_pos = self.env.ball_pos[0].detach().cpu().numpy().copy()
+
+            crossing = self._interpolate_plane_cross(prev_ball, ball_pos, plane_x)
+            if crossing is not None:
+                impact_point = crossing
+                success = True
+                break
+
+            if step > 0 and self._ball_hit_ground(ball_pos, ball_radius):
+                break
+
+            prev_ball = ball_pos
+
+            if done.any():
+                break
+
+        error = None
+        if success and impact_point is not None:
+            error = math.sqrt((impact_point[0] - target_pos[1]) ** 2 + (impact_point[1] - target_pos[2]) ** 2)
+
+        return {"success": success, "impact": impact_point, "error": error}
+
+    def _interpolate_plane_cross(self, prev_pos, curr_pos, plane_x):
+        prev_x = prev_pos[0]
+        curr_x = curr_pos[0]
+        if prev_x <= plane_x <= curr_x and not math.isclose(curr_x, prev_x):
+            t = (plane_x - prev_x) / (curr_x - prev_x)
+            if 0.0 <= t <= 1.0:
+                y = prev_pos[1] + t * (curr_pos[1] - prev_pos[1])
+                z = prev_pos[2] + t * (curr_pos[2] - prev_pos[2])
+                return (float(y), float(z))
+        return None
+
+    def _ball_hit_ground(self, ball_pos, ball_radius):
+        return ball_pos[2] <= ball_radius + 5e-3
+
+    def _write_evaluation_csv(self, csv_path, rows):
+        fieldnames = ["target_y", "target_z", "impact_y", "impact_z", "error", "success"]
+        with open(csv_path, "w", newline="") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+    def _export_evaluation_reports(self, aggregated, y_values, z_values, output_dir, run_name):
+        heatmap_path = os.path.join(output_dir, "kicking_eval_heatmap.png")
+        scatter_y = []
+        scatter_z = []
+        scatter_errors = []
+        scatter_success = []
+        error_matrix = np.full((len(z_values), len(y_values)), np.nan)
+
+        for zi, z in enumerate(z_values):
+            for yi, y in enumerate(y_values):
+                key = (round(float(y), 4), round(float(z), 4))
+                stats = aggregated.get(key)
+                mean_error = np.nan
+                success_rate = 0.0
+                if stats and stats["attempts"] > 0:
+                    success_rate = stats["success"] / stats["attempts"]
+                    if stats["errors"]:
+                        mean_error = float(np.mean(stats["errors"]))
+                error_matrix[zi, yi] = mean_error
+                scatter_y.append(y)
+                scatter_z.append(z)
+                scatter_errors.append(mean_error)
+                scatter_success.append(success_rate)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        color_values = np.array(scatter_errors)
+        if np.all(np.isnan(color_values)):
+            color_values = np.zeros_like(color_values)
+        sizes = 200 * (np.array(scatter_success) + 0.1)
+        sc = ax.scatter(scatter_y, scatter_z, c=color_values, cmap="viridis", s=sizes, edgecolors="k")
+        cbar = fig.colorbar(sc, ax=ax)
+        cbar.set_label("Erro médio (m)")
+        ax.set_xlabel("Posição Y do alvo (m)")
+        ax.set_ylabel("Posição Z do alvo (m)")
+        ax.set_title("Precisão do chute por alvo (Y, Z)")
+        ax.set_xticks(y_values)
+        ax.set_yticks(z_values)
+        fig.tight_layout()
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(height, width, 3)
+        fig.savefig(heatmap_path, bbox_inches="tight")
+        plt.close(fig)
+
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            writer = SummaryWriter(log_dir=os.path.join(output_dir, "summaries"))
+            writer.add_image("evaluation/error_heatmap", image.transpose(2, 0, 1), dataformats="CHW")
+            writer.flush()
+            writer.close()
+        except Exception as exc:
+            print(f"Falha ao registrar heatmap no TensorBoard: {exc}")
+
+        if self.cfg["runner"]["use_wandb"]:
+            try:
+                import wandb
+
+                if wandb.run is None:
+                    project_name = self.cfg["basic"]["task"].replace("/", "_")
+                    wandb.init(project=project_name, name=f"evaluation-{run_name}", config=self.cfg)
+                wandb.log({"evaluation/error_heatmap": wandb.Image(heatmap_path)})
+            except Exception as exc:
+                print(f"Falha ao registrar heatmap no WandB: {exc}")
 
     def interrupt_handler(self, signal, frame):
         print("\nInterrupt received, waiting for video to finish...")

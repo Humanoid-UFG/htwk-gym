@@ -377,3 +377,21 @@ rewards:
   # Parameters for ball acceleration reward
   ball_acceleration_scale: 80.0        # Scaling factor for acceleration towards target
   max_ball_acceleration_reward: 80.0    # Maximum reward for ball acceleration towards target
+
+evaluation:
+  num_episodes_per_target: 20  # Quantas vezes chutar para o mesmo alvo
+  max_episode_length_s: 5.0    # Tempo limite por chute
+  
+  # Definição do Grid de Alvos (Benchmark)
+  target_grid:
+    distance_x: 6.0          # Distância fixa do plano do gol [m]
+    width_range: [-1.0, 1.0] # Faixa horizontal (Y)
+    num_points_y: 5          # Divisões em Y (ex: esquerda, meio-esq, centro, meio-dir, direita)
+    height_range: [0.1, 1.2] # Faixa vertical (Z)
+    num_points_z: 3          # Divisões em Z (ex: rasteiro, meio-alto, alto)
+
+  # Condições Iniciais Estéreis (Sem aleatoriedade)
+  fixed_reset:
+    robot_pos: [0.0, 0.0, 0.72]
+    robot_rot: [0.0, 0.0, 0.0, 1.0]
+    ball_pos: [0.3, 0.0, 0.06]

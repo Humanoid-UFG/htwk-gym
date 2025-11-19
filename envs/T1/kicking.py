@@ -35,6 +35,9 @@ class Kicking(BaseTask):
         self.env_successes = 0
         self.env_falling = 0
         self.ball_velocities = []
+        self.eval_mode = False
+        self.eval_target_pos = None
+        self.eval_reset_config = None
 
     def _create_envs(self):
         self.num_envs = self.cfg["env"]["num_envs"]
@@ -530,7 +533,10 @@ class Kicking(BaseTask):
         self.last_ball_lin_vel_world[env_ids] = 0.0 # Reset for selected envs
 
     def _reset_dofs(self, env_ids):
-        self.dof_pos[env_ids] = apply_randomization(self.default_dof_pos, self.cfg["randomization"].get("init_dof_pos"))
+        if self.eval_mode:
+            self.dof_pos[env_ids] = self.default_dof_pos
+        else:
+            self.dof_pos[env_ids] = apply_randomization(self.default_dof_pos, self.cfg["randomization"].get("init_dof_pos"))
         self.dof_vel[env_ids] = 0.0
         # Multiply by number of actors per environment to retrieve robot actor indices
         env_ids_int32 = (self.actors_per_env * env_ids).to(dtype=torch.int32)
@@ -539,26 +545,34 @@ class Kicking(BaseTask):
         )
 
     def _reset_root_states(self, env_ids):
-        # Initialize robot states (index 0)
-        self.root_states[env_ids, 0, :] = self.base_init_state
-        self.root_states[env_ids, 0, :2] += self.env_origins[env_ids, :2]
-        #self.root_states[env_ids, 0, :2] = apply_randomization(self.root_states[env_ids, 0, :2], self.cfg["randomization"].get("init_base_pos_xy"))
-        #self.root_states[env_ids, 0, 2] += self.terrain.terrain_heights(self.root_states[env_ids, 0, :2])
-        self.root_states[env_ids, 0, 3:7] = quat_from_euler_xyz(
-            torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
-            torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
-            apply_randomization(
+        if self.eval_mode and self.eval_reset_config is not None:
+            robot_pos = self.eval_reset_config["robot_pos"].repeat(len(env_ids), 1)
+            robot_pos[:, :2] += self.env_origins[env_ids, :2]
+            self.root_states[env_ids, 0, 0:3] = robot_pos
+            self.root_states[env_ids, 0, 3:7] = self.eval_reset_config["robot_rot"].repeat(len(env_ids), 1)
+            self.root_states[env_ids, 0, 7:13] = 0.0
+            self._apply_eval_ball_reset(env_ids)
+        else:
+            # Initialize robot states (index 0)
+            self.root_states[env_ids, 0, :] = self.base_init_state
+            self.root_states[env_ids, 0, :2] += self.env_origins[env_ids, :2]
+            #self.root_states[env_ids, 0, :2] = apply_randomization(self.root_states[env_ids, 0, :2], self.cfg["randomization"].get("init_base_pos_xy"))
+            #self.root_states[env_ids, 0, 2] += self.terrain.terrain_heights(self.root_states[env_ids, 0, :2])
+            self.root_states[env_ids, 0, 3:7] = quat_from_euler_xyz(
                 torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
-                self.cfg["randomization"].get("init_base_ang")
-                ),
-        )
-        self.root_states[env_ids, 0, 7:9] = apply_randomization(
-            torch.zeros(len(env_ids), 2, dtype=torch.float, device=self.device),
-            self.cfg["randomization"].get("init_base_lin_vel_xy"),
-        )
+                torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
+                apply_randomization(
+                    torch.zeros(len(env_ids), dtype=torch.float, device=self.device),
+                    self.cfg["randomization"].get("init_base_ang")
+                    ),
+            )
+            self.root_states[env_ids, 0, 7:9] = apply_randomization(
+                torch.zeros(len(env_ids), 2, dtype=torch.float, device=self.device),
+                self.cfg["randomization"].get("init_base_lin_vel_xy"),
+            )
 
-        # Reset ball in front of the (newly reset) robot
-        self._reset_ball_at_robot_front(env_ids)
+            # Reset ball in front of the (newly reset) robot
+            self._reset_ball_at_robot_front(env_ids)
         self._reset_target(env_ids)
 
         # Update the simulation with new state tensor for robot, ball and target
@@ -581,6 +595,10 @@ class Kicking(BaseTask):
     def _reset_ball_at_robot_front(self, env_ids_to_reset_ball):
         """Resets the ball in front of the robot for the specified environment IDs."""
         if len(env_ids_to_reset_ball) == 0:
+            return
+
+        if self.eval_mode and self.eval_reset_config is not None:
+            self._apply_eval_ball_reset(env_ids_to_reset_ball)
             return
 
         robot_pos = self.root_states[env_ids_to_reset_ball, 0, 0:3]
@@ -629,13 +647,66 @@ class Kicking(BaseTask):
                 len(ball_actor_indices)
             )
 
+    def _apply_eval_ball_reset(self, env_ids):
+        ball_pos = self.eval_reset_config["ball_pos"].repeat(len(env_ids), 1)
+        ball_pos[:, :2] += self.env_origins[env_ids, :2]
+        self.root_states[env_ids, self.ball_actor_id, 0:3] = ball_pos
+        self.root_states[env_ids, self.ball_actor_id, 3:7] = self.eval_reset_config["ball_rot"].repeat(len(env_ids), 1)
+        self.root_states[env_ids, self.ball_actor_id, 7:13] = 0.0
+        ball_actor_indices = (self.actors_per_env * env_ids + self.ball_actor_id).to(dtype=torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_states),
+            gymtorch.unwrap_tensor(ball_actor_indices),
+            len(ball_actor_indices),
+        )
+
+    def set_evaluation_mode(self, target_pos=None, reset_config=None):
+        """Enable or disable sterile evaluation mode."""
+        if target_pos is None or reset_config is None:
+            self.eval_mode = False
+            self.eval_target_pos = None
+            self.eval_reset_config = None
+            return
+
+        self.eval_mode = True
+        target_tensor = to_torch(target_pos, device=self.device, dtype=torch.float).view(1, 3).repeat(self.num_envs, 1)
+        target_tensor[:, :2] += self.env_origins[:, :2]
+        self.eval_target_pos = target_tensor.clone()
+        robot_pos = to_torch(reset_config["robot_pos"], device=self.device, dtype=torch.float).view(1, 3)
+        robot_rot = to_torch(reset_config["robot_rot"], device=self.device, dtype=torch.float).view(1, 4)
+        ball_pos = to_torch(reset_config["ball_pos"], device=self.device, dtype=torch.float).view(1, 3)
+        identity_quat = to_torch([0.0, 0.0, 0.0, 1.0], device=self.device).view(1, 4)
+        self.eval_reset_config = {
+            "robot_pos": robot_pos,
+            "robot_rot": robot_rot,
+            "ball_pos": ball_pos,
+            "ball_rot": identity_quat,
+        }
+
+        self.target_pos[:] = target_tensor
+        self.root_states[:, self.target_actor_id, 0:3] = target_tensor
+        self.root_states[:, self.target_actor_id, 3:7] = identity_quat.repeat(self.num_envs, 1)
+        self.root_states[:, self.target_actor_id, 7:13] = 0.0
+        target_actor_indices = (
+            self.actors_per_env * torch.arange(self.num_envs, device=self.device, dtype=torch.long) + self.target_actor_id
+        ).to(dtype=torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_states),
+            gymtorch.unwrap_tensor(target_actor_indices),
+            len(target_actor_indices),
+        )
+
     def _reset_target(self, env_ids):
         """Resets or randomizes the kick target for the specified environment IDs."""
         if len(env_ids) == 0:
             return
 
         num_reset = len(env_ids)
-        if self.target_randomize:
+        if self.eval_mode and self.eval_target_pos is not None:
+            target_positions = self.eval_target_pos[env_ids]
+        elif self.target_randomize:
             base_pos = self.root_states[env_ids, 0, 0:3]
             base_quat = self.root_states[env_ids, 0, 3:7]
             _, _, base_yaw = get_euler_xyz(base_quat)
